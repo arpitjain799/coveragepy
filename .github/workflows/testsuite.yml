@@ -77,7 +77,7 @@ jobs:
           # For extreme debugging:
           # python -c "import urllib.request as r; exec(r.urlopen('https://bit.ly/pydoctor').read())"
 
-      - name: "Run tox for ${{ matrix.python-version }}"
+      - name: "Run tox for ${{ matrix.python-version }} lorem ipsum quia dolor sit amet consectetur adipisci velit, sed quia non numquam eius modi tempora incidunt"
         run: |
           python -m tox -- -rfsEX
 
