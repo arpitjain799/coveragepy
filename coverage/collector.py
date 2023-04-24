@@ -144,7 +144,6 @@ class Collector:
         if HAS_CTRACER and not timid:
             use_ctracer = True
 
-        #if HAS_CTRACER and self._trace_class is CTracer:
         if use_ctracer:
             self._trace_class = CTracer
             self.file_disposition_class = CFileDisposition

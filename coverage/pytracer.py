@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import atexit
 import dis
+import inspect
 import sys
 import threading
+import traceback
 
 from types import FrameType, ModuleType
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, cast
@@ -31,6 +33,11 @@ if RESUME is None:
 # everything.  Don't trace ourselves.
 
 THIS_FILE = __file__.rstrip("co")
+
+sysmon = getattr(sys, "monitoring", None)
+if sysmon:
+    sysmon.use_tool_id(sysmon.COVERAGE_ID, "coverage.py")
+
 
 class PyTracer(TTracer):
     """Python implementation of the raw data tracer."""
@@ -83,6 +90,8 @@ class PyTracer(TTracer):
         # Cache a bound method on the instance, so that we don't have to
         # re-create a bound method object all the time.
         self._cached_bound_method_trace: TTraceFn = self._trace
+
+        self.use_sysmon = sysmon and not self.should_start_context
 
     def __repr__(self) -> str:
         me = id(self)
@@ -289,11 +298,34 @@ class PyTracer(TTracer):
                     #self.log("~", "starting on different threads")
                     return self._cached_bound_method_trace
 
+        # sys.monitoring is appropriate if we are not using contexts.
+        if self.use_sysmon:
+            myid = sysmon.COVERAGE_ID
+            events = sysmon.events
+            sysmon.set_events(
+                myid,
+                events.PY_START | events.PY_RETURN | events.LINE,
+            )
+            sysmon.register_callback(myid, events.PY_START, self.sysmon_py_start)
+            # Use PY_START globally, then use set_local_event(LINE) for interesting
+            # frames, so i might not need to bookkeep which are the interesting frame.
+            sysmon.register_callback(myid, events.PY_RESUME, self.sysmon_py_resume)
+            sysmon.register_callback(myid, events.PY_RETURN, self.sysmon_py_return)
+            sysmon.register_callback(myid, events.PY_YIELD, self.sysmon_py_yield)
+            # UNWIND is like RETURN/YIELD
+            sysmon.register_callback(myid, events.LINE, self.sysmon_line)
+            sysmon.register_callback(myid, events.BRANCH, self.sysmon_branch)
+            return
+
         sys.settrace(self._cached_bound_method_trace)
         return self._cached_bound_method_trace
 
     def stop(self) -> None:
         """Stop this Tracer."""
+        if self.use_sysmon:
+            sysmon.set_events(sysmon.COVERAGE_ID, 0)
+            return
+
         # Get the active tracer callback before setting the stop flag to be
         # able to detect if the tracer was changed prior to stopping it.
         tf = sys.gettrace()
@@ -335,3 +367,76 @@ class PyTracer(TTracer):
     def get_stats(self) -> Optional[Dict[str, int]]:
         """Return a dictionary of statistics, or None."""
         return None
+
+    def panopticon(meth):
+        def _wrapped(self, *args, **kwargs):
+            try:
+                return meth(self, *args, **kwargs)
+            except:
+                with open("/tmp/pan.out", "a") as f:
+                    sysmon.set_events(sysmon.COVERAGE_ID, 0)
+                    exc = sys.exception()
+                    traceback.print_exception(exc, file=f)
+                raise
+        return _wrapped
+
+    @panopticon
+    def sysmon_py_start(self, code, instruction_offset: int):
+        # Entering a new frame.  Decide if we should trace in this file.
+        self._activity = True
+        self.data_stack.append(
+            (
+                self.cur_file_data,
+                self.cur_file_name,
+                self.last_line,
+                False,  # started_context
+            )
+        )
+
+        filename = code.co_filename
+        if filename != self.cur_file_name:
+            self.cur_file_name = filename
+            disp = self.should_trace_cache.get(filename)
+            if disp is None:
+                frame = inspect.currentframe()
+                disp = self.should_trace(filename, frame)
+                self.should_trace_cache[filename] = disp
+
+            self.cur_file_data = None
+            if disp.trace:
+                tracename = disp.source_filename
+                assert tracename is not None
+                if tracename not in self.data:
+                    self.data[tracename] = set()    # type: ignore[assignment]
+                self.cur_file_data = self.data[tracename]
+
+        self.last_line = -code.co_firstlineno
+
+    def sysmon_py_resume():
+        ...
+
+    @panopticon
+    def sysmon_py_return(self, code, instruction_offset: int, retval: object):
+        # TODO: arcs
+        self.cur_file_data, self.cur_file_name, self.last_line, self.started_context = (
+            self.data_stack.pop()
+        )
+
+    def sysmon_py_yield():
+        ...
+
+    @panopticon
+    def sysmon_line(self, code, line_number: int):
+        if self.cur_file_data is not None:
+            with open("/tmp/foo.out", "a") as f: print(f"{code=}, {line_number=}", file=f)
+            if self.trace_arcs:
+                cast(Set[TArc], self.cur_file_data).add((self.last_line, line_number))
+            else:
+                cast(Set[TLineNo], self.cur_file_data).add(line_number)
+            self.last_line = line_number
+        return sysmon.DISABLE
+
+    def sysmon_branch():
+        ...
+
+
